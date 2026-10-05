@@ -92,6 +92,28 @@ fn detections_to_tracker_keypoints(persons: &[PersonDetection]) -> Vec<[[f32; 3]
         .collect()
 }
 
+/// Per-detection COCO-17 keypoint confidences. The Kalman tracker carries
+/// positions only, so these are copied onto the track after each update.
+/// Unmapped (centroid-filled) slots stay 0.0 so they render as unobserved.
+fn detections_to_tracker_confidences(persons: &[PersonDetection]) -> Vec<[f32; NUM_KEYPOINTS]> {
+    persons
+        .iter()
+        .map(|person| {
+            let mut conf = [0.0_f32; NUM_KEYPOINTS];
+            for kp in &person.keypoints {
+                if let Some(idx) = keypoint_name_to_coco_index(&kp.name) {
+                    conf[idx] = if kp.confidence.is_finite() {
+                        kp.confidence.clamp(0.0, 1.0) as f32
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            conf
+        })
+        .collect()
+}
+
 /// Convert confirmed PoseTracker tracks back into server-side PersonDetection values.
 ///
 /// Returns only tracks the UI is meant to render right now (Tentative + Active).
@@ -216,6 +238,7 @@ pub fn tracker_update(
 
     // Convert detections to f32 keypoint arrays
     let all_keypoints = detections_to_tracker_keypoints(&persons);
+    let all_confidences = detections_to_tracker_confidences(&persons);
 
     // Compute centroids for each detection
     let centroids: Vec<[f32; 3]> = all_keypoints
@@ -290,19 +313,24 @@ pub fn tracker_update(
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0);
 
-    // Update matched tracks (uses update_keypoints for proper lifecycle transitions)
+    // Update matched tracks (uses update_keypoints for proper lifecycle transitions);
+    // create new tracks for unmatched detections. Either way, carry the detection's
+    // per-keypoint confidence onto the track; the tracker never sets it, so the
+    // UI otherwise sees 0.0 everywhere and draws no skeleton.
     for (det_idx, track_id_opt) in matched.iter().enumerate() {
-        if let Some(track_id) = track_id_opt {
-            if let Some(track) = tracker.find_track_mut(*track_id) {
-                track.update_keypoints(&all_keypoints[det_idx], 0.08, 1.0, timestamp_us);
+        let track_id = match track_id_opt {
+            Some(track_id) => {
+                if let Some(track) = tracker.find_track_mut(*track_id) {
+                    track.update_keypoints(&all_keypoints[det_idx], 0.08, 1.0, timestamp_us);
+                }
+                *track_id
             }
-        }
-    }
-
-    // Create new tracks for unmatched detections
-    for (det_idx, track_id_opt) in matched.iter().enumerate() {
-        if track_id_opt.is_none() {
-            tracker.create_track(&all_keypoints[det_idx], timestamp_us);
+            None => tracker.create_track(&all_keypoints[det_idx], timestamp_us),
+        };
+        if let Some(track) = tracker.find_track_mut(track_id) {
+            for (kp, conf) in track.keypoints.iter_mut().zip(&all_confidences[det_idx]) {
+                kp.confidence = *conf;
+            }
         }
     }
 
@@ -437,6 +465,32 @@ mod tests {
         // All three updates should return the same track ID
         assert_eq!(id1, id2, "Track ID should be stable across updates");
         assert_eq!(id2, id3, "Track ID should be stable across updates");
+    }
+
+    /// Tracked keypoints must carry the detection's confidence (new and matched
+    /// tracks); unmapped slots stay 0.0. Previously every keypoint shipped 0.0,
+    /// so the UI renderer filtered out the whole skeleton.
+    #[test]
+    fn test_tracker_update_preserves_keypoint_confidence() {
+        let mut tracker = PoseTracker::new();
+        let mut last_instant: Option<Instant> = None;
+        let person = make_person(
+            0,
+            vec![
+                make_keypoint("nose", 1.0, 2.0, 0.0),
+                make_keypoint("left_shoulder", 0.8, 2.5, 0.0),
+                make_keypoint("right_shoulder", 1.2, 2.5, 0.0),
+            ],
+        );
+
+        for _ in 0..2 {
+            let out = tracker_update(&mut tracker, &mut last_instant, vec![person.clone()]);
+            assert_eq!(out.len(), 1);
+            let kps = &out[0].keypoints;
+            assert!((kps[0].confidence - 0.9).abs() < 1e-5); // nose
+            assert!((kps[5].confidence - 0.9).abs() < 1e-5); // left_shoulder
+            assert_eq!(kps[1].confidence, 0.0); // left_eye: unmapped
+        }
     }
 
     /// Regression test for #420 (ADR-082): tracks that have transitioned to
