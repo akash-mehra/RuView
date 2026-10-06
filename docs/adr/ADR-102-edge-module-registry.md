@@ -93,9 +93,9 @@ The existing dashboard's "Capabilities" section continues to show RuView-native 
 
 ### Configuration
 
-- `--edge-registry-url <URL>` — override the default (default: `https://storage.googleapis.com/cognitum-apps/app-registry.json`)
+- `--edge-registry-url <URL>` — opt in to the registry (default: empty, i.e. disabled with no outbound fetch). Canonical catalog: `https://storage.googleapis.com/cognitum-apps/app-registry.json`
 - `--edge-registry-ttl-secs <N>` — override the cache TTL (default: 3600)
-- `--no-edge-registry` — disable the endpoint entirely (returns 404). For air-gapped deployments.
+- `--no-edge-registry` — disable the endpoint entirely (returns 404), even when a URL is set.
 
 ## Consequences
 
@@ -108,7 +108,7 @@ The existing dashboard's "Capabilities" section continues to show RuView-native 
 
 ### Negative
 
-- Adds an outbound HTTP dependency to the sensing-server. Air-gapped deployments must use `--no-edge-registry`.
+- Adds an optional outbound HTTP dependency to the sensing-server. It is off by default; operators opt in with `--edge-registry-url`.
 - Stale-but-served behaviour can mask upstream outages from operators. Mitigation: include `stale: true` + `fetched_at` in the response so the UI can render a "registry possibly out of date" badge.
 
 ### Risks
@@ -125,7 +125,7 @@ A real review of the attack surface this endpoint introduces.
 | # | Threat | Mitigation in this ADR |
 |---|--------|------------------------|
 | T1 | **SSRF** — operator-supplied `--edge-registry-url` redirects fetches to an internal target | Flag is operator-only (CLI / env) — there is no API endpoint to mutate it at runtime. Operators are already trusted (they control the binary). |
-| T2 | **Outbound dependency reveals deployment** — a passive observer of the egress sees the appliance phoning home to GCS | Documented in the docstring + the runtime startup log. Operators wanting offline deployments use `--no-edge-registry`. |
+| T2 | **Outbound dependency reveals deployment** — a passive observer of the egress sees the appliance phoning home to GCS | Documented in the docstring + the runtime startup log. Off by default; only operators who pass `--edge-registry-url` fetch upstream. |
 | T3 | **Malicious upstream registry** — Cognitum's GCS bucket is breached and a poisoned `app-registry.json` is served | Two layers absorb this: (a) the registry's role is **discovery only** — installs verify the per-cog `binary_sha256` + `binary_signature` (ADR-100); a wrong description string can mislead a human, but a wrong binary still has to pass Ed25519 against `COGNITUM_OWNER_SIGNING_KEY`. (b) The endpoint exposes `upstream_sha256` so a paranoid operator can pin the expected registry hash externally and alert on drift. |
 | T4 | **Response inflation** — upstream returns a multi-GB payload to exhaust memory | `MAX_PAYLOAD_BYTES = 8 MiB` cap (current registry is ~50–200 KB). Exceeding cap returns an error without buffering past the cap. |
 | T5 | **Slow upstream blocking server threads** — Slowloris-style stall on the fetch | 10-second wire timeout via `ureq::AgentBuilder`. Per-handler fetch runs inside `tokio::task::spawn_blocking` so a stalled fetch never blocks the async runtime. |
