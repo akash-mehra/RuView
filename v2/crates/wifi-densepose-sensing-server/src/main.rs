@@ -271,14 +271,16 @@ struct Args {
     // ADR-102: Edge Module Registry — surface the canonical Cognitum
     // cog catalog via `GET /api/v1/edge/registry`.
     // ---------------------------------------------------------------
-    /// Override the upstream URL for the edge module registry. Set to a
-    /// mirror or local file://... URL for air-gapped deployments. Empty
-    /// string or --no-edge-registry disables the endpoint entirely.
+    /// Upstream URL for the edge module registry. Empty by default: the
+    /// endpoint is disabled and the server makes no outbound fetch. Opt in
+    /// with the canonical catalog
+    /// (https://storage.googleapis.com/cognitum-apps/app-registry.json) or a
+    /// mirror / local file://... URL. --no-edge-registry always disables it.
     #[arg(
         long,
         value_name = "URL",
         env = "RUVIEW_EDGE_REGISTRY_URL",
-        default_value = "https://storage.googleapis.com/cognitum-apps/app-registry.json"
+        default_value = ""
     )]
     edge_registry_url: String,
 
@@ -4582,9 +4584,13 @@ async fn probe_wifi() -> bool {
 }
 
 /// Probe if ESP32 is streaming on UDP port
-async fn probe_esp32(port: u16) -> bool {
-    let addr = format!("0.0.0.0:{port}");
-    match UdpSocket::bind(&addr).await {
+/// Probe on the operator's `--udp-bind` address (loopback by default, ADR-296),
+/// never a hardcoded wildcard that would briefly expose :5005 to the LAN.
+async fn probe_esp32(bind: &str, port: u16) -> bool {
+    let Ok(ip) = bind.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match UdpSocket::bind(std::net::SocketAddr::new(ip, port)).await {
         Ok(sock) => {
             // 2048 covers the largest ADR-018 frame: an ESP32-C6 HE-SU
             // capture is 532 bytes (issue #1005); on Windows a too-small
@@ -11843,7 +11849,7 @@ async fn main() {
     let normalized = if args.source == "simulate" { "simulated" } else { args.source.as_str() };
     let plan = if normalized == "auto" {
         info!("Auto-detecting data source (UDP :{} bound either way)...", args.udp_port);
-        let esp32 = probe_esp32(args.udp_port).await;
+        let esp32 = probe_esp32(&args.udp_bind, args.udp_port).await;
         let wifi = if esp32 { false } else { probe_wifi().await };
         if esp32 {
             info!("  ESP32 CSI detected on UDP :{}", args.udp_port);
@@ -12021,7 +12027,7 @@ async fn main() {
     let edge_registry: Option<
         std::sync::Arc<wifi_densepose_sensing_server::edge_registry::EdgeRegistry>,
     > = if args.no_edge_registry || args.edge_registry_url.is_empty() {
-        info!("Edge module registry: DISABLED (--no-edge-registry or empty URL)");
+        info!("Edge module registry: DISABLED (default; opt in with --edge-registry-url)");
         None
     } else {
         info!(
